@@ -1,0 +1,39 @@
+name: Album Art Finder
+version: "0.1.0"
+slug: albumart_finder
+description: "Serve changing album art from MQTT metadata (media/gym)"
+url: "https://example.com/albumart-finder"
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: services
+boot: auto
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "Album art HTTP endpoint"
+panel_admin: false
+host_network: false
+ingress: false
+options:
+  mqtt:
+    host: "homeassistant.local"
+    port: 1883
+    username: ""
+    password: ""
+    topic: "media/gym"
+  http_port: 8099
+  static_dir: "/data/albumart"
+  log_level: "INFO"
+schema:
+  mqtt:
+    host: str
+    port: int
+    username: str?
+    password: password?
+    topic: str
+  http_port: int
+  static_dir: str
+  log_level: list(INFO|DEBUG|WARNING|ERROR)
+webui: "http://[HOST]:[PORT:8099]/status"

@@ -1,0 +1,23 @@
+#!/usr/bin/with-contenv bashio
+set -euo pipefail
+
+# Read options
+MQTT_HOST="$(bashio::config 'mqtt.host')"
+MQTT_PORT="$(bashio::config 'mqtt.port')"
+MQTT_USERNAME="$(bashio::config 'mqtt.username')"
+MQTT_PASSWORD="$(bashio::config 'mqtt.password')"
+MQTT_TOPIC="$(bashio::config 'mqtt.topic')"
+HTTP_PORT="$(bashio::config 'http_port')"
+STATIC_DIR="$(bashio::config 'static_dir')"
+LOG_LEVEL="$(bashio::config 'log_level')"
+
+export MQTT_HOST MQTT_PORT MQTT_USERNAME MQTT_PASSWORD MQTT_TOPIC LOG_LEVEL
+export HTTP_HOST="0.0.0.0"
+export HTTP_PORT="${HTTP_PORT}"
+export STATIC_DIR="${STATIC_DIR}"
+
+# Ensure static dir exists
+mkdir -p "${STATIC_DIR}"
+
+bashio::log.info "Starting Album Art Finder on port ${HTTP_PORT}"
+exec python3 /opt/albumart/run.py
