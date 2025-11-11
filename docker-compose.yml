@@ -1,0 +1,22 @@
+services:
+  albumart:
+    image: ghcr.io/yourname/albumart:latest # or build locally; see below
+    container_name: albumart
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      # allow override in Portainer UI if env_file missing
+      HTTP_HOST: "0.0.0.0"
+    ports:
+      - "8099:8099"
+    volumes:
+      - albumart_data:/data/albumart
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/status"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+
+volumes:
+  albumart_data:
