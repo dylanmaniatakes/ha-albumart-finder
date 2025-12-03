@@ -1,6 +1,7 @@
 services:
   albumart:
-    image: ghcr.io/yourname/albumart:latest # or build locally; see below
+    image: ghcr.io/yourname/albumart:latest
+    # or build locally; see below
     container_name: albumart
     restart: unless-stopped
     env_file:

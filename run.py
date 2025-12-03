@@ -27,6 +27,11 @@ Key envs (also supported in .env):
   HTTP_HOST        (default "0.0.0.0")
   HTTP_PORT        (default 8099)
   STATIC_DIR       (default "static")
+  REQUIRE_ARTIST_MATCH     (default false) — only accept results whose artist roughly matches
+  PREFER_ALBUM_WHEN_NO_ARTIST (default true) — try album-only first if artist is missing
+  MIN_TITLE_RATIO          (default 0.55) — fuzzy threshold 0..1 for title match
+  MIN_ALBUM_RATIO          (default 0.55) — fuzzy threshold 0..1 for album match
+  MAX_ITUNES_RESULTS       (default 5) — number of results to score per query
 
 Run locally:
   pip install flask paho-mqtt requests
@@ -108,7 +113,15 @@ HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8099"))
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "static"))
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
 ALBUMART_PATH = STATIC_DIR / "albumart.jpg"
+
+# Matching controls for better accuracy when artist data is missing/incorrect
+REQUIRE_ARTIST_MATCH = os.getenv("REQUIRE_ARTIST_MATCH", "false").lower() in {"1","true","yes","on"}
+PREFER_ALBUM_WHEN_NO_ARTIST = os.getenv("PREFER_ALBUM_WHEN_NO_ARTIST", "true").lower() in {"1","true","yes","on"}
+MIN_TITLE_RATIO = float(os.getenv("MIN_TITLE_RATIO", "0.55"))
+MIN_ALBUM_RATIO = float(os.getenv("MIN_ALBUM_RATIO", "0.55"))
+MAX_ITUNES_RESULTS = int(os.getenv("MAX_ITUNES_RESULTS", "5"))
 
 # ----------------------
 # Global state
@@ -129,52 +142,118 @@ if not ALBUMART_PATH.exists():
 # Artwork lookup
 # ----------------------
 
-def _search_itunes(query: str, entity: str = "song") -> Optional[str]:
-    """Return artwork URL (prefer hi-res) for a query via iTunes Search API."""
+import re
+from difflib import SequenceMatcher
+
+_WORD_RE = re.compile(r"[^a-z0-9]+")
+
+def _norm(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = s.lower().strip()
+    s = re.sub(r"\(.*?\)|\[.*?\]", "", s)  # drop bracketed extras
+    s = _WORD_RE.sub(" ", s)
+    return " ".join(s.split())
+
+def _ratio(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+def _search_itunes(query: str, entity: str = "song", limit: int = 5) -> list:
+    """Return a list of iTunes result dicts for a query."""
     try:
         resp = requests.get(
             "https://itunes.apple.com/search",
-            params={"term": query, "entity": entity, "limit": 1},
+            params={"term": query, "entity": entity, "limit": limit},
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
-        results = data.get("results", [])
-        if not results:
-            return None
-        art = results[0].get("artworkUrl100")
-        if not art:
-            return None
-        # Upgrade size: .../100x100bb.jpg -> /600x600bb.jpg
-        return art.replace("100x100", "600x600")
+        return data.get("results", [])
     except Exception as e:
         logger.warning("iTunes lookup failed for '%s': %s", query, e)
-        return None
+        return []
 
 
 def find_album_art(artist: Optional[str], title: Optional[str], album: Optional[str]) -> Optional[bytes]:
-    """Try to fetch album art image bytes using several queries."""
-    queries = []
-    if artist and title:
-        queries.append((f"{artist} {title}", "song"))
-    if artist and album:
-        queries.append((f"{artist} {album}", "album"))
-    if title:
-        queries.append((title, "song"))
-    if album:
-        queries.append((album, "album"))
+    """Fetch album art with fuzzy matching and optional artist enforcement.
 
-    for q, entity in queries:
-        url = _search_itunes(q, entity=entity)
-        if not url:
-            continue
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            if r.content and r.headers.get("Content-Type", "").startswith("image/"):
-                return r.content
-        except Exception as e:
-            logger.warning("Failed to download art from %s: %s", url, e)
+    Strategy:
+      1) Build query list depending on available fields.
+      2) For each query, fetch up to MAX_ITUNES_RESULTS results and score them.
+      3) Pick the best-scoring candidate above thresholds and download its art.
+    """
+    n_artist, n_title, n_album = _norm(artist), _norm(title), _norm(album)
+
+    queries = []  # (term, entity, qtype)
+    if n_artist and n_title:
+        queries.append((f"{artist} {title}", "song", "artist_title"))
+    if n_artist and n_album:
+        queries.append((f"{artist} {album}", "album", "artist_album"))
+
+    # When artist is missing or unreliable, optionally try album first
+    if not n_artist and n_album and PREFER_ALBUM_WHEN_NO_ARTIST:
+        queries.append((album, "album", "album_only"))
+    if n_title:
+        queries.append((title, "song", "title_only"))
+    if n_album and (n_artist or not PREFER_ALBUM_WHEN_NO_ARTIST):
+        queries.append((album, "album", "album_only"))
+
+    best = None  # (score, result_dict)
+
+    for term, entity, qtype in queries:
+        results = _search_itunes(term, entity=entity, limit=MAX_ITUNES_RESULTS)
+        for r in results:
+            it_title = _norm(r.get("trackName") or r.get("collectionName"))
+            it_album = _norm(r.get("collectionName"))
+            it_artist = _norm(r.get("artistName"))
+
+            # Artist constraint (if requested) — skip if we have artist and mismatch
+            if REQUIRE_ARTIST_MATCH and n_artist and it_artist and n_artist not in it_artist and it_artist not in n_artist:
+                continue
+
+            # Compute fuzzy similarities
+            t_ratio = _ratio(n_title, it_title)
+            a_ratio = _ratio(n_album, it_album)
+            ar_ratio = _ratio(n_artist, it_artist)
+
+            # Base score: favor exact-ish title/album depending on query type
+            score = 0.0
+            if qtype == "artist_title":
+                score = 0.6 * t_ratio + 0.3 * ar_ratio + 0.1 * a_ratio
+            elif qtype == "artist_album":
+                score = 0.6 * a_ratio + 0.3 * ar_ratio + 0.1 * t_ratio
+            elif qtype == "title_only":
+                score = 0.8 * t_ratio + 0.2 * a_ratio
+            else:  # album_only
+                score = 0.8 * a_ratio + 0.2 * t_ratio
+
+            # Threshold filters
+            if n_title and t_ratio < MIN_TITLE_RATIO and qtype != "album_only":
+                continue
+            if n_album and a_ratio < MIN_ALBUM_RATIO and qtype != "title_only":
+                continue
+
+            # Track best
+            if not best or score > best[0]:
+                best = (score, r)
+
+    if not best:
+        return None
+
+    r = best[1]
+    art = r.get("artworkUrl100") or r.get("artworkUrl60")
+    if not art:
+        return None
+    art = art.replace("100x100", "600x600")
+    try:
+        resp = requests.get(art, timeout=15)
+        resp.raise_for_status()
+        if resp.content and resp.headers.get("Content-Type", "").startswith("image/"):
+            return resp.content
+    except Exception as e:
+        logger.warning("Failed to download art from %s: %s", art, e)
     return None
 
 
@@ -246,7 +325,7 @@ def start_mqtt_loop():
     if not MQTT_HOST:
         logger.error("MQTT_HOST is required. Set it via environment variable or .env file.")
         return
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="albumart-finder")
+    client = mqtt.Client(client_id="albumart-finder")
     if MQTT_USERNAME:
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     client.on_connect = on_connect
